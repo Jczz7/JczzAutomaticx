@@ -11,6 +11,7 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
 
 local okEnv, genv = pcall(function() return getgenv() end)
 if not okEnv then genv = nil end
@@ -20,8 +21,8 @@ local TOP_H = 50
 
 -- Forward declarations dos modulos
 local UI = { items = {}, navButtons = {}, statusText = "Ready" }
-local Log, Notify, Info, Status, Filter, Nav, Panel, Modal, Loader, Layout, Drag =
-    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+local Log, Notify, Info, Status, Filter, Nav, Panel, Modal, Loader, Layout, Drag, Appearance, FPSPage, H =
+    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 
 ----------------------------------------------------------------------
 -- 1. CONFIGURACAO
@@ -91,13 +92,15 @@ local Scripts = {
     },
     {
         Name = "Jczz FPS", Icon = "⚡", Category = "Performance", RequiresKey = false,
-        Loader = [[loadstring(game:HttpGet("https://raw.githubusercontent.com/Jeannxx7/JczzFPS/refs/heads/main/JczzFPS.lua"))()]],
+        Loader = "(painel)", Page = "fps", Desc = "Abrir painel de otimização  ›",
     },
 }
 
 ----------------------------------------------------------------------
 -- 2. TEMA E HELPERS
 ----------------------------------------------------------------------
+local Settings
+
 local Theme = {
     Bg = Color3.fromRGB(22, 18, 15),
     Side = Color3.fromRGB(12, 10, 8),
@@ -162,6 +165,10 @@ local function stroke(o, color, thickness, transparency)
 end
 
 local function tween(o, t, props, style)
+    if Settings and Settings.Animations == false then
+        for k, v in pairs(props) do pcall(function() o[k] = v end) end
+        return
+    end
     TweenService:Create(o, TweenInfo.new(t, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
 end
 
@@ -174,24 +181,73 @@ local function trim(s)
     return (tostring(s):match("^%s*(.-)%s*$"))
 end
 
-local function shortErr(e)
+local function shortErr(e, max)
+    max = max or 80
     local s = tostring(e or "erro desconhecido"):gsub("[\r\n]+", " ")
     s = trim(s)
-    if #s > 80 then s = s:sub(1, 77) .. "..." end
+    if #s > max then s = s:sub(1, max - 3) .. "..." end
     return s
 end
 
 ----------------------------------------------------------------------
 -- 2b. CONFIGURACOES E COR DE DESTAQUE (persistem durante a sessao)
 ----------------------------------------------------------------------
-local Settings = { Notifications = true, AccentName = "GOLD" }
-if genv then
-    genv.JczzAutomaticSettings = genv.JczzAutomaticSettings or {}
-    for k, v in pairs(Settings) do
-        if genv.JczzAutomaticSettings[k] == nil then genv.JczzAutomaticSettings[k] = v end
+local HttpService = game:GetService("HttpService")
+
+local SettingDefaults = {
+    Notifications = true, AccentName = "GOLD", Background = true, Dim = 0.45, PanelSize = "Normal",
+    Animations = true, FloatingButton = true, StartOpen = true, ToggleKey = "RightShift",
+    SaveToFile = true, AutoFPS = false, FPSCap = 0,
+}
+
+-- Salva as configuracoes em arquivo (quando o executor permite) e na memoria da sessao.
+local SaveSys = { file = "JczzAutomatic_config.json", pending = false }
+
+function SaveSys.fill(t)
+    for k, v in pairs(SettingDefaults) do
+        if t[k] == nil or type(t[k]) ~= type(v) then t[k] = v end
     end
-    Settings = genv.JczzAutomaticSettings
+    if type(t.FPSFeatures) ~= "table" then t.FPSFeatures = {} end
+    if type(t.Favorites) ~= "table" then t.Favorites = {} end
+    return t
 end
+
+function SaveSys.read()
+    if typeof(isfile) ~= "function" or typeof(readfile) ~= "function" then return nil end
+    local ok, data = pcall(function()
+        if not isfile(SaveSys.file) then return nil end
+        return HttpService:JSONDecode(readfile(SaveSys.file))
+    end)
+    if ok and type(data) == "table" then return data end
+    return nil
+end
+
+function SaveSys.flush()
+    if Settings.SaveToFile == false then return end
+    if typeof(writefile) ~= "function" then return end
+    pcall(function() writefile(SaveSys.file, HttpService:JSONEncode(Settings)) end)
+end
+
+function SaveSys.queue()
+    if SaveSys.pending then return end
+    SaveSys.pending = true
+    task.delay(1.5, function()
+        SaveSys.pending = false
+        SaveSys.flush()
+    end)
+end
+
+Settings = {}
+if genv and type(genv.JczzAutomaticSettings) == "table" then
+    Settings = genv.JczzAutomaticSettings
+else
+    local saved = SaveSys.read()
+    if saved then
+        for k, v in pairs(saved) do Settings[k] = v end
+    end
+    if genv then genv.JczzAutomaticSettings = Settings end
+end
+SaveSys.fill(Settings)
 
 local AccentColors = {
     { "GOLD", Color3.fromRGB(226, 176, 72) },
@@ -240,10 +296,730 @@ function Accent.set(name)
     end
     Accent.targets = alive
     for _, fn in ipairs(Accent.hooks) do pcall(fn, color) end
+    SaveSys.queue()
 end
 
 Theme.Accent = Accent.colorOf(Settings.AccentName)
 Accent.derive(Theme.Accent)
+
+----------------------------------------------------------------------
+-- 2c. JCZZ FPS (motor de otimizacao)
+-- Cada funcao guarda os valores originais e consegue desfazer o que fez.
+----------------------------------------------------------------------
+local FPS = { state = {}, hooks = {}, cap = 0, features = {}, groups = {}, presets = {}, byId = {} }
+do
+    local Lighting = game:GetService("Lighting")
+    local StarterGui = game:GetService("StarterGui")
+    local Workspace = game:GetService("Workspace")
+    local SoundService = game:GetService("SoundService")
+    local StatsService = game:GetService("Stats")
+    local LocalPlayer = Players.LocalPlayer
+
+    local orig, keep, fconns = {}, {}, {}
+    local queue, qh, qt = {}, 1, 0
+    local watch = { on = false }
+    local objList = {}
+    local coreOrig = {}
+    local gcToken = 0
+    local overlay = nil
+
+    local EMIT = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
+    local LIGHT = { PointLight = true, SpotLight = true, SurfaceLight = true }
+
+    ------------------------------------------------------------------
+    -- Leitura/escrita segura de propriedades (inclui propriedades ocultas)
+    ------------------------------------------------------------------
+    local function getp(inst, prop)
+        local ok, v = pcall(function() return inst[prop] end)
+        if ok then return true, v end
+        if typeof(gethiddenproperty) == "function" then
+            local ok2, v2 = pcall(gethiddenproperty, inst, prop)
+            if ok2 then return true, v2 end
+        end
+        return false
+    end
+
+    local function setp(inst, prop, value)
+        if pcall(function() inst[prop] = value end) then return true end
+        if typeof(sethiddenproperty) == "function" then
+            return (pcall(sethiddenproperty, inst, prop, value))
+        end
+        return false
+    end
+
+    -- Cria o "gravador" de uma funcao: muda a propriedade e lembra o valor original.
+    local function recorder(id)
+        return function(inst, prop, value)
+            local t = orig[id]
+            if not t then
+                t = setmetatable({}, { __mode = "k" })
+                orig[id] = t
+            end
+            local entry = t[inst]
+            if not entry then
+                entry = {}
+                t[inst] = entry
+            end
+            if entry[prop] == nil then
+                local ok, cur = getp(inst, prop)
+                if not ok then return false end
+                if cur == value then return true end
+                entry[prop] = cur
+            end
+            if prop == "Parent" and value == nil then keep[inst] = true end
+            return setp(inst, prop, value)
+        end
+    end
+
+    local function restore(id)
+        local t = orig[id]
+        orig[id] = nil
+        if not t then return end
+        local n = 0
+        for inst, props in pairs(t) do
+            for prop, value in pairs(props) do
+                if prop == "Parent" then
+                    pcall(function() inst.Parent = value end)
+                    keep[inst] = nil
+                else
+                    setp(inst, prop, value)
+                end
+            end
+            n = n + 1
+            if n % 300 == 0 then task.wait() end
+        end
+    end
+
+    local function addConn(id, c)
+        local list = fconns[id]
+        if not list then
+            list = {}
+            fconns[id] = list
+        end
+        table.insert(list, c)
+    end
+
+    local function dropConns(id)
+        local list = fconns[id]
+        fconns[id] = nil
+        if list then
+            for _, c in ipairs(list) do pcall(function() c:Disconnect() end) end
+        end
+    end
+
+    local function guiParent()
+        local ok, hui = pcall(function() return gethui and gethui() end)
+        if ok and typeof(hui) == "Instance" then return hui end
+        local okCore = pcall(function()
+            local t = Instance.new("Folder")
+            t.Parent = CoreGui
+            t:Destroy()
+        end)
+        if okCore then return CoreGui end
+        return Players.LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    local function terrain() return Workspace:FindFirstChildOfClass("Terrain") end
+    local function renderSettings()
+        local ok, r = pcall(function() return settings().Rendering end)
+        if ok then return r end
+        return nil
+    end
+    local function physSettings()
+        local ok, r = pcall(function() return settings().Physics end)
+        if ok then return r end
+        return nil
+    end
+    local function gameSettings()
+        local ok, r = pcall(function() return UserSettings():GetService("UserGameSettings") end)
+        if ok then return r end
+        return nil
+    end
+
+    ------------------------------------------------------------------
+    -- Grupos e funcoes
+    ------------------------------------------------------------------
+    FPS.groups = {
+        { id = "gfx", title = "GRÁFICOS" },
+        { id = "fx", title = "EFEITOS VISUAIS" },
+        { id = "world", title = "MUNDO" },
+        { id = "players", title = "OUTROS JOGADORES" },
+        { id = "sys", title = "SISTEMA" },
+    }
+
+    local features = {
+        -- GRAFICOS
+        {
+            id = "quality", group = "gfx", name = "Qualidade mínima", desc = "Nível gráfico 1 do Roblox",
+            global = function(on, rec)
+                if not on then return end
+                local rs, gs = renderSettings(), gameSettings()
+                if rs then rec(rs, "QualityLevel", Enum.QualityLevel.Level01) end
+                if gs then rec(gs, "SavedQualityLevel", Enum.SavedQualitySetting.QualityLevel1) end
+            end,
+        },
+        {
+            id = "shadows", group = "gfx", name = "Sem sombras", desc = "Desliga todas as sombras",
+            global = function(on, rec)
+                if not on then return end
+                rec(Lighting, "GlobalShadows", false)
+                rec(Lighting, "ShadowSoftness", 0)
+            end,
+            obj = function(v, rec)
+                if LIGHT[v.ClassName] then
+                    rec(v, "Shadows", false)
+                elseif v:IsA("BasePart") and not v:IsA("Terrain") and v.CastShadow then
+                    rec(v, "CastShadow", false)
+                end
+            end,
+        },
+        {
+            id = "materials", group = "gfx", name = "Materiais lisos", desc = "Tudo vira plástico liso, sem reflexo",
+            obj = function(v, rec)
+                if v:IsA("BasePart") and not v:IsA("Terrain") then
+                    rec(v, "Material", Enum.Material.SmoothPlastic)
+                    rec(v, "Reflectance", 0)
+                end
+            end,
+        },
+        {
+            id = "textures", group = "gfx", name = "Sem texturas", desc = "Remove texturas, decals e SurfaceAppearance",
+            obj = function(v, rec)
+                local c = v.ClassName
+                if c == "MeshPart" then
+                    rec(v, "TextureID", "")
+                elseif c == "SpecialMesh" then
+                    rec(v, "TextureId", "")
+                elseif c == "Decal" or c == "Texture" then
+                    if not (v.Parent and v.Parent.Name == "Head") then rec(v, "Transparency", 1) end
+                elseif c == "SurfaceAppearance" then
+                    rec(v, "Parent", nil)
+                end
+            end,
+        },
+        {
+            id = "meshes", group = "gfx", name = "Malhas simples", desc = "Menos detalhe nos modelos 3D",
+            global = function(on, rec)
+                if not on then return end
+                local rs = renderSettings()
+                if rs then rec(rs, "MeshPartDetailLevel", Enum.MeshPartDetailLevel.Level04) end
+            end,
+            obj = function(v, rec)
+                if v.ClassName == "MeshPart" then rec(v, "RenderFidelity", Enum.RenderFidelity.Performance) end
+            end,
+        },
+        {
+            id = "lighting", group = "gfx", name = "Iluminação simples", desc = "Sem reflexo do ambiente",
+            global = function(on, rec)
+                if not on then return end
+                rec(Lighting, "EnvironmentDiffuseScale", 0)
+                rec(Lighting, "EnvironmentSpecularScale", 0)
+            end,
+        },
+        {
+            id = "compat", group = "gfx", name = "Modo Compatibilidade", desc = "Iluminação mais leve (pode exigir reentrar)",
+            supported = function() return typeof(sethiddenproperty) == "function" end,
+            global = function(on, rec)
+                if on then rec(Lighting, "Technology", Enum.Technology.Compatibility) end
+            end,
+        },
+
+        -- EFEITOS
+        {
+            id = "particles", group = "fx", name = "Sem partículas", desc = "Fogo, fumaça, rastros, brilhos e explosões",
+            obj = function(v, rec)
+                local c = v.ClassName
+                if EMIT[c] then
+                    rec(v, "Enabled", false)
+                elseif c == "Explosion" then
+                    rec(v, "Visible", false)
+                end
+            end,
+        },
+        {
+            id = "post", group = "fx", name = "Sem pós-efeitos", desc = "Bloom, blur, raios de sol e correção de cor",
+            obj = function(v, rec)
+                if v:IsA("PostEffect") then rec(v, "Enabled", false) end
+            end,
+        },
+        {
+            id = "atmosphere", group = "fx", name = "Céu e atmosfera leves", desc = "Sem névoa, nuvens, estrelas e sol/lua",
+            obj = function(v, rec)
+                local c = v.ClassName
+                if c == "Atmosphere" then
+                    rec(v, "Density", 0)
+                    rec(v, "Haze", 0)
+                    rec(v, "Glare", 0)
+                elseif c == "Clouds" then
+                    rec(v, "Enabled", false)
+                elseif c == "Sky" then
+                    rec(v, "StarCount", 0)
+                    rec(v, "CelestialBodiesShown", false)
+                end
+            end,
+        },
+        {
+            id = "lights", group = "fx", name = "Desligar luzes", desc = "PointLight, SpotLight e SurfaceLight",
+            obj = function(v, rec)
+                if LIGHT[v.ClassName] then rec(v, "Enabled", false) end
+            end,
+        },
+
+        -- MUNDO
+        {
+            id = "water", group = "world", name = "Água simples", desc = "Sem ondas e sem reflexo",
+            global = function(on, rec)
+                if not on then return end
+                local t = terrain()
+                if t then
+                    rec(t, "WaterWaveSize", 0)
+                    rec(t, "WaterWaveSpeed", 0)
+                    rec(t, "WaterReflectance", 0)
+                end
+            end,
+        },
+        {
+            id = "grass", group = "world", name = "Sem grama", desc = "Remove a decoração do terreno",
+            global = function(on, rec)
+                if not on then return end
+                local t = terrain()
+                if t then rec(t, "Decoration", false) end
+            end,
+        },
+        {
+            id = "billboards", group = "world", name = "Sem painéis flutuantes", desc = "Esconde BillboardGui e SurfaceGui do mapa",
+            obj = function(v, rec)
+                local c = v.ClassName
+                if c == "BillboardGui" or c == "SurfaceGui" then rec(v, "Enabled", false) end
+            end,
+        },
+        {
+            id = "physics", group = "world", name = "Física leve", desc = "Experimental: alivia a física do ambiente",
+            global = function(on, rec)
+                if not on then return end
+                local ph = physSettings()
+                if not ph then return end
+                rec(ph, "AllowSleep", true)
+                local ok, v = pcall(function() return Enum.EnviromentalPhysicsThrottle.Always end)
+                if ok and v then rec(ph, "PhysicsEnvironmentalThrottle", v) end
+            end,
+        },
+
+        -- OUTROS JOGADORES
+        {
+            id = "simpleplayers", group = "players", name = "Jogadores simples", desc = "Sem roupas e acessórios dos outros",
+            charObj = function(d, rec)
+                local c = d.ClassName
+                if c == "Accessory" or c == "Shirt" or c == "Pants" or c == "ShirtGraphic" or c == "CharacterMesh" then
+                    rec(d, "Parent", nil)
+                end
+            end,
+        },
+        {
+            id = "noanim", group = "players", name = "Congelar animações", desc = "Para as animações dos outros jogadores",
+            charObj = function(d, rec, conn)
+                if d.ClassName == "Animator" then
+                    pcall(function()
+                        for _, tr in ipairs(d:GetPlayingAnimationTracks()) do tr:Stop(0) end
+                    end)
+                    conn(d.AnimationPlayed:Connect(function(tr) pcall(function() tr:Stop(0) end) end))
+                end
+            end,
+        },
+        {
+            id = "hideplayers", group = "players", name = "Esconder jogadores", desc = "Deixa os outros jogadores invisíveis",
+            charObj = function(d, rec)
+                if d:IsA("BasePart") then
+                    rec(d, "LocalTransparencyModifier", 1)
+                elseif d:IsA("Decal") then
+                    rec(d, "Transparency", 1)
+                elseif EMIT[d.ClassName] then
+                    rec(d, "Enabled", false)
+                end
+            end,
+        },
+
+        -- SISTEMA
+        {
+            id = "sound", group = "sys", name = "Silenciar o jogo", desc = "Volume zero e sem reverb",
+            global = function(on, rec)
+                if not on then return end
+                local gs = gameSettings()
+                if gs then rec(gs, "MasterVolume", 0) end
+                rec(SoundService, "AmbientReverb", Enum.ReverbType.NoReverb)
+            end,
+        },
+        {
+            id = "coregui", group = "sys", name = "Esconder chat e lista", desc = "Menos interface para o Roblox desenhar",
+            global = function(on, rec)
+                local types = { Enum.CoreGuiType.Chat, Enum.CoreGuiType.PlayerList }
+                if on then
+                    for _, ct in ipairs(types) do
+                        local cur = true
+                        local ok, v = pcall(function() return StarterGui:GetCoreGuiEnabled(ct) end)
+                        if ok then cur = v end
+                        coreOrig[ct] = cur
+                        pcall(function() StarterGui:SetCoreGuiEnabled(ct, false) end)
+                    end
+                    local okT, cfg = pcall(function() return game:GetService("TextChatService").ChatWindowConfiguration end)
+                    if okT and cfg then rec(cfg, "Enabled", false) end
+                else
+                    for ct, v in pairs(coreOrig) do
+                        pcall(function() StarterGui:SetCoreGuiEnabled(ct, v) end)
+                    end
+                    coreOrig = {}
+                end
+            end,
+        },
+        {
+            id = "autogc", group = "sys", name = "Limpeza automática", desc = "Libera memória a cada 60 segundos",
+            global = function(on)
+                gcToken = gcToken + 1
+                if not on then return end
+                local my = gcToken
+                task.spawn(function()
+                    while my == gcToken do
+                        for _ = 1, 60 do
+                            task.wait(1)
+                            if my ~= gcToken then return end
+                        end
+                        pcall(collectgarbage, "collect")
+                    end
+                end)
+            end,
+        },
+        {
+            id = "fpsOverlay", group = "sys", name = "Contador de FPS na tela", desc = "Mostra o FPS no canto da tela",
+            global = function(on)
+                if overlay then
+                    pcall(function() overlay:Destroy() end)
+                    overlay = nil
+                end
+                if not on then return end
+                local parent = guiParent()
+                local old = parent:FindFirstChild("JczzFPS")
+                if old then old:Destroy() end
+
+                local gui = Instance.new("ScreenGui")
+                gui.Name = "JczzFPS"
+                gui.ResetOnSpawn = false
+                gui.DisplayOrder = 998
+                local label = Instance.new("TextLabel")
+                label.BackgroundColor3 = Color3.fromRGB(12, 10, 8)
+                label.BackgroundTransparency = 0.35
+                label.BorderSizePixel = 0
+                label.Position = UDim2.fromOffset(8, 8)
+                label.Size = UDim2.fromOffset(86, 24)
+                label.Font = Enum.Font.GothamBold
+                label.TextSize = 13
+                label.TextColor3 = Color3.fromRGB(120, 205, 125)
+                label.Text = "FPS: --"
+                label.Parent = gui
+                local corner = Instance.new("UICorner")
+                corner.CornerRadius = UDim.new(0, 8)
+                corner.Parent = label
+                gui.Parent = parent
+                overlay = gui
+
+                local frames, last = 0, os.clock()
+                addConn("fpsOverlay", RunService.RenderStepped:Connect(function()
+                    frames = frames + 1
+                    local now = os.clock()
+                    if now - last >= 0.5 then
+                        local fps = math.floor(frames / (now - last) + 0.5)
+                        label.Text = "FPS: " .. fps
+                        label.TextColor3 = fps >= 50 and Color3.fromRGB(120, 205, 125)
+                            or (fps >= 30 and Color3.fromRGB(240, 200, 80) or Color3.fromRGB(235, 105, 98))
+                        frames, last = 0, now
+                    end
+                end))
+            end,
+        },
+        {
+            id = "afk3d", group = "sys", name = "Modo economia extrema", desc = "Desliga o 3D: FPS máximo e menos bateria (AFK)",
+            nosave = true, note = "3D desligado. Volte aqui para religar.",
+            global = function(on)
+                pcall(function() RunService:Set3dRenderingEnabled(not on) end)
+            end,
+        },
+    }
+
+    for _, f in ipairs(features) do
+        f.rec = recorder(f.id)
+        FPS.byId[f.id] = f
+    end
+    FPS.features = features
+
+    ------------------------------------------------------------------
+    -- Observador de objetos novos (processados aos poucos, sem lag)
+    ------------------------------------------------------------------
+    local function push(v)
+        qt = qt + 1
+        queue[qt] = v
+    end
+
+    local function drain()
+        local n = 0
+        while qh <= qt and n < 80 do
+            local v = queue[qh]
+            queue[qh] = nil
+            qh = qh + 1
+            n = n + 1
+            if v and v.Parent then
+                for _, f in ipairs(objList) do
+                    if FPS.state[f.id] then pcall(f.obj, v, f.rec) end
+                end
+            end
+        end
+        if qh > qt then qh, qt = 1, 0 end
+    end
+
+    local function rebuildLists()
+        objList = {}
+        for _, f in ipairs(features) do
+            if FPS.state[f.id] and f.obj then table.insert(objList, f) end
+        end
+        if #objList > 0 then
+            if not watch.on then
+                watch.on = true
+                watch.c1 = Workspace.DescendantAdded:Connect(push)
+                watch.c2 = Lighting.DescendantAdded:Connect(push)
+                watch.c3 = RunService.Heartbeat:Connect(drain)
+            end
+        elseif watch.on then
+            watch.on = false
+            for _, k in ipairs({ "c1", "c2", "c3" }) do
+                if watch[k] then
+                    watch[k]:Disconnect()
+                    watch[k] = nil
+                end
+            end
+            queue, qh, qt = {}, 1, 0
+        end
+    end
+
+    local function sweepObjects(list)
+        if #list == 0 then return end
+        local function run(root)
+            local items = root:GetDescendants()
+            for i, v in ipairs(items) do
+                for _, f in ipairs(list) do
+                    if FPS.state[f.id] then pcall(f.obj, v, f.rec) end
+                end
+                if i % 300 == 0 then task.wait() end
+            end
+        end
+        run(Lighting)
+        run(Workspace)
+    end
+
+    local function hookChars(f)
+        local function connFor() return function(c) addConn(f.id, c) end end
+        local function onChar(char)
+            if not FPS.state[f.id] then return end
+            for _, d in ipairs(char:GetDescendants()) do
+                pcall(f.charObj, d, f.rec, connFor())
+            end
+            addConn(f.id, char.DescendantAdded:Connect(function(d)
+                pcall(f.charObj, d, f.rec, connFor())
+            end))
+        end
+        local function hook(plr)
+            if plr == LocalPlayer then return end
+            if plr.Character then task.spawn(onChar, plr.Character) end
+            addConn(f.id, plr.CharacterAdded:Connect(function(char) task.spawn(onChar, char) end))
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do hook(plr) end
+        addConn(f.id, Players.PlayerAdded:Connect(hook))
+    end
+
+    ------------------------------------------------------------------
+    -- Ligar / desligar
+    ------------------------------------------------------------------
+    local function enable(f)
+        FPS.state[f.id] = true
+        if f.global then pcall(f.global, true, f.rec) end
+        if f.charObj then hookChars(f) end
+    end
+
+    local function disable(f)
+        FPS.state[f.id] = false
+        dropConns(f.id)
+        if f.global then pcall(f.global, false, f.rec) end
+        restore(f.id)
+    end
+
+    function FPS.isOn(id) return FPS.state[id] == true end
+
+    function FPS.isSupported(id)
+        local f = FPS.byId[id]
+        if not f then return false end
+        if f.supported then
+            local ok, r = pcall(f.supported)
+            return ok and r == true
+        end
+        return true
+    end
+
+    function FPS.count()
+        local n = 0
+        for _, f in ipairs(features) do
+            if FPS.state[f.id] then n = n + 1 end
+        end
+        return n, #features
+    end
+
+    function FPS.changed()
+        local saved = {}
+        for _, f in ipairs(features) do
+            if FPS.state[f.id] and not f.nosave then saved[f.id] = true end
+        end
+        Settings.FPSFeatures = saved
+        Settings.FPSCap = FPS.cap
+        SaveSys.queue()
+        for _, fn in ipairs(FPS.hooks) do pcall(fn) end
+    end
+
+    -- changes = { id = true/false, ... }
+    function FPS.set(changes)
+        task.spawn(function()
+            local ons, offs = {}, {}
+            for id, want in pairs(changes) do
+                local f = FPS.byId[id]
+                if f and (FPS.state[id] == true) ~= (want == true) then
+                    if want then
+                        if FPS.isSupported(id) then table.insert(ons, f) end
+                    else
+                        table.insert(offs, f)
+                    end
+                end
+            end
+            for _, f in ipairs(ons) do enable(f) end
+            for _, f in ipairs(offs) do FPS.state[f.id] = false end
+            rebuildLists()
+            FPS.changed()
+
+            local sweepList = {}
+            for _, f in ipairs(ons) do
+                if f.obj then table.insert(sweepList, f) end
+            end
+            for _, f in ipairs(offs) do disable(f) end
+            sweepObjects(sweepList)
+            FPS.changed()
+        end)
+    end
+
+    ------------------------------------------------------------------
+    -- Predefinicoes
+    ------------------------------------------------------------------
+    local function merge(a, b)
+        local out = {}
+        for _, v in ipairs(a) do table.insert(out, v) end
+        for _, v in ipairs(b) do table.insert(out, v) end
+        return out
+    end
+    local L = { "shadows", "post", "particles", "water", "atmosphere" }
+    local M = merge(L, { "grass", "lighting", "meshes", "materials" })
+    local U = merge(M, { "quality", "compat", "textures", "lights", "fpsOverlay" })
+    local P = merge(U, { "simpleplayers", "noanim", "sound", "coregui", "autogc", "billboards", "physics" })
+
+    FPS.presets = {
+        { id = "light", name = "Leve", icon = "🍃", ids = L },
+        { id = "medium", name = "Médio", icon = "⚖️", ids = M },
+        { id = "ultra", name = "Ultra", icon = "🔥", ids = U },
+        { id = "potato", name = "Batata", icon = "🥔", ids = P },
+    }
+
+    -- Funcoes que as predefinicoes nunca desligam sozinhas
+    local KEEP = { fpsOverlay = true, afk3d = true, hideplayers = true }
+
+    function FPS.applyPreset(pid)
+        local preset
+        for _, p in ipairs(FPS.presets) do
+            if p.id == pid then preset = p end
+        end
+        if not preset then return end
+        local want, changes = {}, {}
+        for _, id in ipairs(preset.ids) do want[id] = true end
+        for _, f in ipairs(features) do
+            if want[f.id] then
+                changes[f.id] = true
+            elseif not KEEP[f.id] then
+                changes[f.id] = false
+            end
+        end
+        FPS.set(changes)
+    end
+
+    function FPS.disableAll()
+        local changes = {}
+        for _, f in ipairs(features) do changes[f.id] = false end
+        FPS.set(changes)
+    end
+
+    ------------------------------------------------------------------
+    -- Limite de FPS, memoria e ping
+    ------------------------------------------------------------------
+    FPS.caps = {
+        { label = "30", value = 30 }, { label = "60", value = 60 }, { label = "90", value = 90 },
+        { label = "120", value = 120 }, { label = "Livre", value = 0 },
+    }
+
+    function FPS.capSupported() return typeof(setfpscap) == "function" end
+
+    function FPS.setCap(v)
+        FPS.cap = v
+        if FPS.capSupported() then
+            pcall(setfpscap, v == 0 and 1000 or v)
+        end
+        FPS.changed()
+    end
+
+    function FPS.memory()
+        local ok, mb = pcall(function() return StatsService:GetTotalMemoryUsageMb() end)
+        if ok and type(mb) == "number" then return mb end
+        return nil
+    end
+
+    function FPS.ping()
+        local ok, v = pcall(function() return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+        if ok and type(v) == "number" then return math.floor(v + 0.5) end
+        return nil
+    end
+
+    function FPS.clean()
+        local before = FPS.memory()
+        pcall(collectgarbage, "collect")
+        task.wait(0.4)
+        return before, FPS.memory()
+    end
+
+    ------------------------------------------------------------------
+    -- Inicio / fim
+    ------------------------------------------------------------------
+    function FPS.autoApply()
+        local changes = {}
+        for id in pairs(Settings.FPSFeatures or {}) do
+            local f = FPS.byId[id]
+            if f and not f.nosave then changes[id] = true end
+        end
+        if next(changes) then FPS.set(changes) end
+        if (Settings.FPSCap or 0) ~= 0 then
+            FPS.cap = Settings.FPSCap
+            if FPS.capSupported() then pcall(setfpscap, FPS.cap) end
+        end
+    end
+
+    function FPS.shutdown()
+        for _, f in ipairs(features) do
+            if FPS.state[f.id] then disable(f) end
+        end
+        rebuildLists()
+    end
+
+    FPS.oldShutdown = genv and genv.JczzFPSShutdown or nil
+    if genv then genv.JczzFPSShutdown = FPS.shutdown end
+end
 
 ----------------------------------------------------------------------
 -- 3. FUNDO (imagem embutida, gravada uma unica vez no workspace do executor)
@@ -539,6 +1315,10 @@ if genv then
     genv.JczzAutomaticFavorites = genv.JczzAutomaticFavorites or {}
     Favs = genv.JczzAutomaticFavorites
 end
+for k, v in pairs(Settings.Favorites) do
+    if Favs[k] == nil then Favs[k] = v end
+end
+Settings.Favorites = Favs
 
 local function countFavs()
     local n = 0
@@ -672,6 +1452,8 @@ function Info.paint(entry)
     local d = Info.data[entry]
     if d then
         item.Info.Text, item.Info.TextColor3 = d[1], d[2]
+    elseif entry.Desc then
+        item.Info.Text, item.Info.TextColor3 = entry.Desc, Theme.Accent
     elseif entry.RequiresKey then
         item.Info.Text, item.Info.TextColor3 = "Requires Key", Theme.Key
     else
@@ -698,6 +1480,39 @@ function Loader.isBusy(entry)
     return Loader.busy[entry] == true
 end
 
+-- Download alternativo para executores onde game:HttpGet falha.
+local function httpRequest(url)
+    local req = (syn and syn.request) or (http and http.request) or http_request or request
+        or (fluxus and fluxus.request)
+    if typeof(req) ~= "function" then return nil, nil end
+    local ok, res = pcall(req, { Url = url, Method = "GET" })
+    if not ok then return nil, shortErr(res, 100) end
+    if type(res) ~= "table" then return nil, "resposta invalida" end
+    if res.StatusCode and res.StatusCode ~= 200 then return nil, "HTTP " .. tostring(res.StatusCode) end
+    if type(res.Body) ~= "string" then return nil, "sem corpo" end
+    return res.Body
+end
+
+-- Tenta game:HttpGet e, se falhar, a funcao request do executor.
+-- Links http:// tambem sao tentados em https://.
+local function httpGet(url, useTrue)
+    local candidates = { url }
+    if url:sub(1, 7) == "http://" then table.insert(candidates, "https://" .. url:sub(8)) end
+    local lastErr = "sem resposta"
+    for _, u in ipairs(candidates) do
+        local ok, res = pcall(function()
+            if useTrue then return game:HttpGet(u, true) end
+            return game:HttpGet(u)
+        end)
+        if ok and type(res) == "string" and #res > 0 then return res end
+        lastErr = ok and "resposta vazia" or shortErr(res, 100)
+        local body, err = httpRequest(u)
+        if body and #body > 0 then return body end
+        if err then lastErr = lastErr .. " / " .. err end
+    end
+    return nil, lastErr
+end
+
 -- Baixa e executa SOMENTE o loader registrado na configuracao.
 -- A key (quando existir) e entregue ao script via variavel global "script_key",
 -- mantida apenas na memoria e removida depois de 60s. Nada e salvo nem enviado
@@ -706,6 +1521,12 @@ local function fetchAndRun(entry, key)
     if not table.find(Scripts, entry) then
         return false, "Entrada nao registrada na configuracao"
     end
+    -- Scripts embutidos (ex.: Jczz FPS) rodam direto, sem download.
+    if entry.Run then
+        local okE, errE = pcall(entry.Run)
+        if not okE then return false, "Erro no script: " .. shortErr(errE, 140) end
+        return true
+    end
     if typeof(loadstring) ~= "function" then
         return false, "loadstring indisponivel neste executor"
     end
@@ -713,23 +1534,24 @@ local function fetchAndRun(entry, key)
     if not url then
         return false, "Loader invalido na configuracao"
     end
-    -- Mantem o segundo argumento (true) quando o loader original o utiliza.
     local useTrue = entry.Loader:find('HttpGet%(%s*"[^"]+"%s*,%s*true') ~= nil
 
-    local okGet, src = pcall(function()
-        if useTrue then return game:HttpGet(url, true) end
-        return game:HttpGet(url)
-    end)
-    if not okGet then
-        return false, "HttpGet falhou: " .. shortErr(src)
+    local src, gerr = httpGet(url, useTrue)
+    if not src then
+        return false, "Download falhou: " .. tostring(gerr)
     end
-    if type(src) ~= "string" or #src == 0 then
-        return false, "Resposta vazia do servidor"
+
+    local head = trim(src:sub(1, 300)):lower()
+    if head:sub(1, 1) == "<" then
+        return false, "O link devolveu uma pagina web, nao um script"
+    end
+    if head:sub(1, 13) == "404: not found" then
+        return false, "Link offline (404)"
     end
 
     local fn, cerr = loadstring(src)
     if not fn then
-        return false, "loadstring falhou: " .. shortErr(cerr)
+        return false, "loadstring falhou: " .. shortErr(cerr, 120)
     end
 
     if key and genv then
@@ -739,9 +1561,17 @@ local function fetchAndRun(entry, key)
         end)
     end
 
-    local okRun, rerr = pcall(fn)
-    if not okRun then
-        return false, "Erro ao executar: " .. shortErr(rerr)
+    -- Roda em outra thread: hubs que ficam em loop nao travam o botao nem
+    -- sao marcados como falha. Erros imediatos (ate 5s) ainda sao detectados.
+    local finished, okRun, rerr = false, true, nil
+    task.spawn(function()
+        local ok, e = pcall(fn)
+        okRun, rerr, finished = ok, e, true
+    end)
+    local t0 = os.clock()
+    while not finished and os.clock() - t0 < 5 do task.wait(0.1) end
+    if finished and not okRun then
+        return false, "Erro no script: " .. shortErr(rerr, 140)
     end
     return true
 end
@@ -765,12 +1595,12 @@ function Loader.run(entry, key)
             Log.add("Loader executed: " .. entry.Name, Theme.Good)
             Notify.push(entry.Name .. " executado.", Theme.Good)
         else
-            Info.set(entry, "✕ Failed · " .. shortErr(err):sub(1, 40), Theme.Bad)
-            Log.add("Falha ao carregar " .. entry.Name .. ": " .. shortErr(err), Theme.Bad)
-            Notify.push("Falha ao executar " .. entry.Name .. ".", Theme.Bad)
+            Info.set(entry, "✕ " .. shortErr(err, 44), Theme.Bad)
+            Log.add("Falha ao carregar " .. entry.Name .. ": " .. shortErr(err, 200), Theme.Bad)
+            Notify.push(entry.Name .. ": " .. shortErr(err, 38), Theme.Bad)
         end
         -- Cooldown curto: o botao volta ao normal e pode tentar de novo.
-        task.delay(3, function()
+        task.delay(ok and 3 or 6, function()
             Info.reset(entry)
             Loader.busy[entry] = nil
         end)
@@ -920,8 +1750,9 @@ end
 function Layout.panelSize()
     local vp = Layout.viewport()
     local portrait = vp.Y > vp.X
-    local maxW = IS_PC and 600 or 560
-    local maxH = portrait and 520 or 380
+    local k = Appearance.sizeFactor()
+    local maxW = (IS_PC and 600 or 560) * k
+    local maxH = (portrait and 520 or 380) * k
     local w = math.min(math.max(240, math.min(maxW, vp.X * 0.92)), vp.X - 8)
     local h = math.min(math.max(260, math.min(maxH, vp.Y * 0.82)), vp.Y - 8)
     return w, h
@@ -1018,7 +1849,7 @@ Nav.current = "home"
 
 function Nav.paint()
     for id, b in pairs(Nav.buttonsById or {}) do
-        local sel = (id == Nav.current)
+        local sel = (id == Nav.current) or (Nav.current == "fps" and id == "Performance")
         b.Btn.BackgroundColor3 = sel and Theme.CardPress or Theme.Card
         b.Btn.BackgroundTransparency = sel and 0.15 or 1
         b.Bar.Visible = sel
@@ -1029,13 +1860,18 @@ end
 table.insert(Accent.hooks, function() Nav.paint() end)
 
 function Nav.select(id)
+    if Nav.current ~= id and Nav.current ~= "fps" then Nav.last = Nav.current end
     Nav.current = id
     Modal.close()
     UI.homePage.Visible = (id == "home")
     UI.logPage.Visible = (id == "log")
     UI.settingsPage.Visible = (id == "settings")
-    UI.scriptsPage.Visible = not (id == "home" or id == "log" or id == "settings")
-    if id == "home" then
+    UI.fpsPage.Visible = (id == "fps")
+    UI.scriptsPage.Visible = not (id == "home" or id == "log" or id == "settings" or id == "fps")
+    FPSPage.setActive(id == "fps")
+    if id == "fps" then
+        UI.pageTitle.Text = "Jczz FPS"
+    elseif id == "home" then
         UI.pageTitle.Text = "Home"
         UI.refreshHome()
     elseif id == "settings" then
@@ -1103,6 +1939,7 @@ function Nav.build()
         btn.Activated:Connect(function() Nav.select(d.id) end)
     end
 
+    valid.fps = true
     if not valid[Nav.current] then Nav.current = "home" end
     Nav.paint()
 end
@@ -1203,6 +2040,11 @@ function UI.makeItem(entry, index)
     end)
 
     frame.Activated:Connect(function()
+        if entry.Page then
+            Log.add(entry.Name .. " aberto")
+            Nav.select(entry.Page)
+            return
+        end
         if Loader.isBusy(entry) then return end
         Log.add(entry.Name .. " selected")
         if entry.RequiresKey then
@@ -1221,6 +2063,7 @@ function UI.makeItem(entry, index)
             Log.add(entry.Name .. " adicionado aos favoritos")
         end
         Filter.apply()
+        SaveSys.queue()
     end)
 end
 
@@ -1240,6 +2083,370 @@ function UI.populate()
     UI.count = count
     Nav.build()
     Nav.select(Nav.current)
+end
+
+----------------------------------------------------------------------
+-- 15b. COMPONENTES REUTILIZAVEIS (cartoes, interruptores, seletores)
+----------------------------------------------------------------------
+H.painters = {}
+
+function H.paintAll()
+    for _, fn in ipairs(H.painters) do pcall(fn) end
+end
+
+function H.header(parent, text, order)
+    local h = mk("Frame", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16), LayoutOrder = order, ClipsDescendants = true,
+    }, parent)
+    mk("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8),
+        VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+    }, h)
+    mk("TextLabel", {
+        Text = text, TextSize = 11, TextColor3 = Theme.Dim, LayoutOrder = 1,
+        AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 16),
+    }, h)
+    mk("Frame", {
+        Size = UDim2.fromOffset(700, 1), LayoutOrder = 2,
+        BackgroundColor3 = Theme.Stroke, BackgroundTransparency = 0.2,
+    }, h)
+    return h
+end
+
+function H.card(parent, title, sub, order, height)
+    local r = mk("Frame", {
+        Size = UDim2.new(1, 0, 0, height or 52), BackgroundColor3 = Theme.Card,
+        BackgroundTransparency = 0.12, LayoutOrder = order,
+    }, parent)
+    round(r, 12)
+    stroke(r, Theme.Stroke, 1, 0.5)
+    local t = mk("TextLabel", {
+        Text = title, Font = Enum.Font.GothamBold, TextSize = 14, TextTruncate = Enum.TextTruncate.AtEnd,
+        Position = UDim2.fromOffset(14, 8), Size = UDim2.new(1, -110, 0, 20),
+    }, r)
+    local s = mk("TextLabel", {
+        Text = sub or "", TextSize = 11, TextColor3 = Theme.Dim, TextTruncate = Enum.TextTruncate.AtEnd,
+        Position = UDim2.fromOffset(14, 29), Size = UDim2.new(1, -110, 0, 16),
+    }, r)
+    return r, t, s
+end
+
+function H.switch(card, isOn, onClick)
+    local track = mk("TextButton", {
+        Text = "", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
+        Size = UDim2.fromOffset(46, 22), BackgroundColor3 = Theme.Stroke, _static = true,
+    }, card)
+    round(track, 11)
+    local knob = mk("Frame", {
+        Size = UDim2.fromOffset(18, 18), Position = UDim2.fromOffset(2, 2),
+        BackgroundColor3 = Theme.Text, _static = true,
+    }, track)
+    round(knob, 9)
+    local sw = { track = track }
+    function sw.paint(animate)
+        local on = isOn()
+        local color = on and Theme.Accent or Theme.Stroke
+        local pos = UDim2.fromOffset(on and 26 or 2, 2)
+        if animate then
+            tween(track, 0.12, { BackgroundColor3 = color })
+            tween(knob, 0.12, { Position = pos })
+        else
+            track.BackgroundColor3 = color
+            knob.Position = pos
+        end
+    end
+    sw.paint(false)
+    table.insert(Accent.hooks, function() sw.paint(false) end)
+    table.insert(H.painters, function() sw.paint(false) end)
+    track.Activated:Connect(function()
+        onClick()
+        sw.paint(true)
+    end)
+    return sw
+end
+
+function H.action(card, text, callback, width)
+    local b = mk("TextButton", {
+        Text = text, Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Center,
+        BackgroundColor3 = Theme.Side, BackgroundTransparency = 0.1,
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
+        Size = UDim2.fromOffset(width or 74, 30),
+    }, card)
+    round(b, 8)
+    stroke(b, Theme.Stroke, 1, 0.4)
+    b.Activated:Connect(callback)
+    return b
+end
+
+-- Cartao com seletor segmentado (ex.: 30 / 60 / 90 / 120 / Livre)
+function H.segCard(parent, title, sub, order, options, isSel, onPick)
+    local card, _, subLabel = H.card(parent, title, sub, order, 88)
+    subLabel.Size = UDim2.new(1, -28, 0, 16)
+    local row = mk("Frame", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 52), Size = UDim2.new(1, -28, 0, 28),
+    }, card)
+    mk("UIGridLayout", {
+        CellSize = UDim2.new(1 / #options, -4, 1, 0), CellPadding = UDim2.fromOffset(4, 0),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, row)
+    local btns = {}
+    local function paint()
+        for i, b in ipairs(btns) do
+            local sel = isSel(options[i].value)
+            b.BackgroundColor3 = sel and Theme.Accent or Theme.Side
+            b.TextColor3 = sel and Color3.fromRGB(25, 18, 8) or Theme.Text
+        end
+    end
+    for i, o in ipairs(options) do
+        local b = mk("TextButton", {
+            Text = o.label, Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Center,
+            BackgroundColor3 = Theme.Side, BackgroundTransparency = 0.1, LayoutOrder = i, _static = true,
+        }, row)
+        round(b, 8)
+        btns[i] = b
+        b.Activated:Connect(function()
+            onPick(o.value)
+            paint()
+        end)
+    end
+    paint()
+    table.insert(Accent.hooks, paint)
+    table.insert(H.painters, paint)
+    return card, paint, subLabel
+end
+
+----------------------------------------------------------------------
+-- 15c. APARENCIA (aplica as configuracoes visuais do hub)
+----------------------------------------------------------------------
+function Appearance.sizeFactor()
+    local m = Settings.PanelSize
+    if m == "Compacto" then return 0.85 end
+    if m == "Grande" then return 1.12 end
+    return 1
+end
+
+Appearance.keyLabels = {
+    RightShift = "RShift", RightControl = "RCtrl", Insert = "Insert", K = "K", F6 = "F6", Home = "Home",
+}
+Appearance.keyOrder = { "RightShift", "RightControl", "Insert", "K", "F6", "Home" }
+
+function Appearance.ensureBg()
+    if UI.bgAsset or UI.bgLoading or Settings.Background == false then return end
+    UI.bgLoading = true
+    task.spawn(function()
+        local asset = loadBackground()
+        UI.bgLoading = false
+        if asset then
+            UI.bgAsset = asset
+            Appearance.apply(false)
+        end
+    end)
+end
+
+function Appearance.apply(animate)
+    if not UI.panel then return end
+    local useBg = Settings.Background ~= false and UI.bgAsset ~= nil
+    if useBg and UI.bg.Image == "" then UI.bg.Image = UI.bgAsset end
+    UI.bg.Visible = useBg
+    UI.shade.BackgroundTransparency = useBg and (Settings.Dim or 0.45) or 0
+    UI.toggle.Visible = (not IS_PC) or Settings.FloatingButton ~= false
+    local key = Appearance.keyLabels[Settings.ToggleKey] or "RShift"
+    UI.hint.Text = (IS_PC and (key .. "  ·  ou ") or "") .. "toque na pílula"
+    if Settings.Background ~= false then Appearance.ensureBg() end
+    Layout.apply(animate)
+end
+
+----------------------------------------------------------------------
+-- 15d. PAGINA DO JCZZ FPS
+----------------------------------------------------------------------
+FPSPage.switches = {}
+FPSPage.active = false
+
+function FPSPage.repaint()
+    for _, sw in pairs(FPSPage.switches) do sw.paint(false) end
+    if FPSPage.sub and FPSPage.sub.Parent then
+        local n, total = FPS.count()
+        FPSPage.sub.Text = n == 0 and "Nenhuma otimização ativa" or (n .. " de " .. total .. " otimizações ativas")
+    end
+    if FPSPage.capPaint then FPSPage.capPaint() end
+end
+
+function FPSPage.setActive(on)
+    on = on == true
+    if on == FPSPage.active then return end
+    FPSPage.active = on
+    if FPSPage.conn then
+        FPSPage.conn:Disconnect()
+        FPSPage.conn = nil
+    end
+    if not on then return end
+    FPSPage.repaint()
+    local frames, last = 0, os.clock()
+    FPSPage.conn = RunService.RenderStepped:Connect(function()
+        frames = frames + 1
+        local now = os.clock()
+        if now - last < 0.5 then return end
+        local fps = math.floor(frames / (now - last) + 0.5)
+        frames, last = 0, now
+        if not (UI.panel and UI.panel.Visible) or Panel.minimized then return end
+        FPSPage.vFPS.Text = tostring(fps)
+        FPSPage.vFPS.TextColor3 = fps >= 50 and Theme.Good or (fps >= 30 and Theme.Warn or Theme.Bad)
+        local ping, mem = FPS.ping(), FPS.memory()
+        FPSPage.vPing.Text = ping and (ping .. " ms") or "--"
+        FPSPage.vMem.Text = mem and (math.floor(mem) .. " MB") or "--"
+    end)
+end
+
+function FPSPage.build(pages)
+    local pg = mk("ScrollingFrame", {
+        Name = "FPS", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false,
+        ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Accent, CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+    }, pages)
+    UI.fpsPage = pg
+    mk("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, pg)
+    mk("UIPadding", { PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 4) }, pg)
+
+    local order = 0
+    local function nextOrder()
+        order = order + 1
+        return order
+    end
+
+    -- Topo
+    local hero = mk("Frame", {
+        Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = Theme.Card, BackgroundTransparency = 0.12,
+        LayoutOrder = nextOrder(),
+    }, pg)
+    round(hero, 12)
+    stroke(hero, Theme.Stroke, 1, 0.5)
+    mk("TextLabel", {
+        Text = "⚡", TextSize = 26, TextXAlignment = Enum.TextXAlignment.Center,
+        Position = UDim2.fromOffset(8, 0), Size = UDim2.new(0, 40, 1, 0),
+    }, hero)
+    mk("TextLabel", {
+        Text = "Jczz FPS", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = Theme.Accent,
+        Position = UDim2.fromOffset(54, 10), Size = UDim2.new(1, -150, 0, 20),
+    }, hero)
+    FPSPage.sub = mk("TextLabel", {
+        Text = "", TextSize = 12, TextColor3 = Theme.Dim, TextTruncate = Enum.TextTruncate.AtEnd,
+        Position = UDim2.fromOffset(54, 32), Size = UDim2.new(1, -150, 0, 18),
+    }, hero)
+    local back = mk("TextButton", {
+        Text = "‹ Voltar", Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Center,
+        BackgroundColor3 = Theme.Side, BackgroundTransparency = 0.1,
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(78, 30),
+    }, hero)
+    round(back, 8)
+    stroke(back, Theme.Stroke, 1, 0.4)
+    back.Activated:Connect(function() Nav.select(Nav.last or "Performance") end)
+
+    -- Medidores ao vivo
+    local grid = mk("Frame", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = nextOrder(),
+    }, pg)
+    mk("UIGridLayout", {
+        CellSize = UDim2.new(1 / 3, -6, 0, 54), CellPadding = UDim2.fromOffset(8, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+    }, grid)
+    FPSPage.vFPS = statCard(grid, "FPS", "--", 1)
+    FPSPage.vPing = statCard(grid, "PING", "--", 2)
+    FPSPage.vMem = statCard(grid, "MEMÓRIA", "--", 3)
+
+    -- Predefinicoes
+    H.header(pg, "PREDEFINIÇÕES", nextOrder())
+    local pgrid = mk("Frame", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = nextOrder(),
+    }, pg)
+    mk("UIGridLayout", {
+        CellSize = UDim2.new(0.5, -4, 0, 40), CellPadding = UDim2.fromOffset(8, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+    }, pgrid)
+    local function gridButton(label, idx, callback)
+        local b = mk("TextButton", {
+            Text = label, Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Center,
+            BackgroundColor3 = Theme.Card, BackgroundTransparency = 0.12, LayoutOrder = idx,
+        }, pgrid)
+        round(b, 10)
+        stroke(b, Theme.Stroke, 1, 0.5)
+        b.Activated:Connect(callback)
+    end
+    for i, p in ipairs(FPS.presets) do
+        gridButton(p.icon .. "  " .. p.name, i, function()
+            FPS.applyPreset(p.id)
+            Log.add("Jczz FPS: predefinição " .. p.name)
+            Notify.push("Predefinição " .. p.name .. " aplicada.", Theme.Good)
+        end)
+    end
+    gridButton("🧹  Limpar memória", 5, function()
+        task.spawn(function()
+            local before, after = FPS.clean()
+            Log.add("Jczz FPS: memória limpa")
+            if before and after then
+                Notify.push(string.format("Memória: %d → %d MB", before, after), Theme.Good)
+            else
+                Notify.push("Memória limpa.", Theme.Good)
+            end
+        end)
+    end)
+    gridButton("⛔  Desligar tudo", 6, function()
+        FPS.disableAll()
+        Log.add("Jczz FPS: tudo desligado")
+        Notify.push("Otimizações desligadas e restauradas.", Theme.Warn)
+    end)
+    mk("TextLabel", {
+        Text = "Leve: sombras e efeitos  ·  Médio: + materiais e malhas  ·  Ultra: + texturas e luzes  ·  Batata: tudo, até jogadores e som.",
+        TextSize = 11, TextColor3 = Theme.Dim, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = nextOrder(),
+    }, pg)
+
+    -- Limite de FPS
+    local capOptions = {}
+    for _, c in ipairs(FPS.caps) do table.insert(capOptions, c) end
+    local _, capPaint, capSub = H.segCard(pg, "Limite de FPS", "Quanto menor, menos esquenta e gasta bateria", nextOrder(),
+        capOptions, function(v) return FPS.cap == v end,
+        function(v)
+            if not FPS.capSupported() then
+                Notify.push("Seu executor não suporta limite de FPS.", Theme.Warn)
+                return
+            end
+            FPS.setCap(v)
+            Log.add("Jczz FPS: limite " .. (v == 0 and "livre" or tostring(v)))
+        end)
+    if not FPS.capSupported() then capSub.Text = "Seu executor não suporta setfpscap" end
+    FPSPage.capPaint = capPaint
+
+    -- Funcoes por grupo
+    for _, g in ipairs(FPS.groups) do
+        H.header(pg, g.title, nextOrder())
+        for _, f in ipairs(FPS.features) do
+            if f.group == g.id then
+                local supported = FPS.isSupported(f.id)
+                local card, title = H.card(pg, f.name, f.desc, nextOrder())
+                if not supported then
+                    title.Text = f.name .. " (indisponível)"
+                    title.TextColor3 = Theme.Dim
+                end
+                local sw
+                sw = H.switch(card, function() return FPS.isOn(f.id) end, function()
+                    if not supported then
+                        Notify.push(f.name .. ": seu executor não suporta.", Theme.Warn)
+                        return
+                    end
+                    local turnOn = not FPS.isOn(f.id)
+                    FPS.set({ [f.id] = turnOn })
+                    Log.add("Jczz FPS: " .. f.name .. (turnOn and " ligado" or " desligado"))
+                    if turnOn and f.note then Notify.push(f.note, Theme.Warn) end
+                end)
+                if not supported then sw.track.BackgroundTransparency = 0.6 end
+                FPSPage.switches[f.id] = sw
+            end
+        end
+    end
+
+    table.insert(FPS.hooks, FPSPage.repaint)
+    table.insert(Accent.hooks, FPSPage.repaint)
+    FPSPage.repaint()
 end
 
 function UI.build(parent)
@@ -1485,6 +2692,8 @@ function UI.build(parent)
         UI.logList.CanvasPosition = Vector2.new(0, math.max(0, logLayout.AbsoluteContentSize.Y))
     end)
 
+    FPSPage.build(UI.pages)
+
     -- Pagina: configuracoes
     local st = mk("ScrollingFrame", {
         Name = "Settings", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false,
@@ -1542,9 +2751,9 @@ function UI.build(parent)
     end
 
     -- Aparencia: cor de destaque
-    sectionHeader("APPEARANCE", 1)
+    sectionHeader("APARÊNCIA", 1)
     mk("TextLabel", {
-        Text = "Accent color: tap a color to recolor the highlights. The background stays the same.",
+        Text = "Cor de destaque: toque numa cor para trocar os destaques. O fundo não muda.",
         TextSize = 12, TextColor3 = Theme.Dim, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
         Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 2,
     }, st)
@@ -1592,52 +2801,149 @@ function UI.build(parent)
     paintSwatches()
     table.insert(Accent.hooks, paintSwatches)
 
-    -- Geral
-    sectionHeader("GENERAL", 4)
-    local nRow = settingRow(5, "Notifications", "Pop-ups when a script runs")
-    local track = mk("TextButton", {
-        Text = "", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
-        Size = UDim2.fromOffset(46, 22), BackgroundColor3 = Theme.Stroke, _static = true,
-    }, nRow)
-    round(track, 11)
-    local knob = mk("Frame", {
-        Size = UDim2.fromOffset(18, 18), Position = UDim2.fromOffset(2, 2), BackgroundColor3 = Theme.Text, _static = true,
-    }, track)
-    round(knob, 9)
-    local function paintSwitch(animate)
-        local on = Settings.Notifications ~= false
-        local goal = { BackgroundColor3 = on and Theme.Accent or Theme.Stroke }
-        local kgoal = { Position = UDim2.fromOffset(on and 26 or 2, 2) }
-        if animate then
-            tween(track, 0.12, goal)
-            tween(knob, 0.12, kgoal)
-        else
-            track.BackgroundColor3 = goal.BackgroundColor3
-            knob.Position = kgoal.Position
-        end
+    local so = 3
+    local function nso()
+        so = so + 1
+        return so
     end
-    paintSwitch(false)
-    table.insert(Accent.hooks, function() paintSwitch(false) end)
-    track.Activated:Connect(function()
-        Settings.Notifications = (Settings.Notifications == false)
-        paintSwitch(true)
-        Log.add("Notifications " .. (Settings.Notifications and "on" or "off"))
-    end)
 
-    actionButton(settingRow(6, "Window position", "Move the panel back to the center"), "Reset", function()
+    local function switchRow(title, sub, key, default, after)
+        local card = H.card(st, title, sub, nso())
+        H.switch(card, function()
+            local v = Settings[key]
+            if v == nil then v = default end
+            return v == true
+        end, function()
+            local v = Settings[key]
+            if v == nil then v = default end
+            Settings[key] = not v
+            if after then after() end
+            SaveSys.queue()
+        end)
+        return card
+    end
+
+    local function dimIs(v) return math.abs((Settings.Dim or 0.45) - v) < 0.01 end
+
+    -- Aparencia (continuacao)
+    do
+        local card = H.card(st, "Hub leve", "Sem fundo e sem animações: ideal para celular fraco", nso())
+        H.switch(card, function()
+            return Settings.Background == false and Settings.Animations == false
+        end, function()
+            local light = not (Settings.Background == false and Settings.Animations == false)
+            Settings.Background = not light
+            Settings.Animations = not light
+            Appearance.apply(false)
+            H.paintAll()
+            SaveSys.queue()
+        end)
+    end
+    switchRow("Imagem de fundo", "Desligue para economizar memória", "Background", true, function()
+        Appearance.apply(false)
+    end)
+    H.segCard(st, "Escurecimento do fundo", "Quanto mais forte, mais fácil de ler", nso(), {
+        { label = "Leve", value = 0.6 }, { label = "Médio", value = 0.45 }, { label = "Forte", value = 0.25 },
+    }, dimIs, function(v)
+        Settings.Dim = v
+        Appearance.apply(false)
+        SaveSys.queue()
+    end)
+    H.segCard(st, "Tamanho do painel", "Compacto ocupa menos tela", nso(), {
+        { label = "Compacto", value = "Compacto" }, { label = "Normal", value = "Normal" },
+        { label = "Grande", value = "Grande" },
+    }, function(v) return (Settings.PanelSize or "Normal") == v end, function(v)
+        Settings.PanelSize = v
+        Layout.centerPanel()
+        Appearance.apply(true)
+        SaveSys.queue()
+    end)
+    switchRow("Animações", "Transições suaves de abrir, fechar e trocar cor", "Animations", true)
+    if IS_PC then
+        switchRow("Botão flutuante", "Mostra a pílula no topo da tela", "FloatingButton", true, function()
+            Appearance.apply(false)
+        end)
+    end
+
+    -- Geral
+    H.header(st, "GERAL", nso())
+    switchRow("Notificações", "Avisos ao executar scripts", "Notifications", true)
+    switchRow("Abrir ao iniciar", "Mostra o painel assim que o hub carrega", "StartOpen", true)
+    if IS_PC then
+        local keyCard, _, keySub = H.card(st, "Tecla para abrir", "", nso())
+        local keyBtn
+        local function paintKey()
+            local name = Settings.ToggleKey or "RightShift"
+            keySub.Text = "Atalho atual: " .. name
+            if keyBtn then keyBtn.Text = Appearance.keyLabels[name] or name end
+        end
+        keyBtn = H.action(keyCard, "", function()
+            local cur = Settings.ToggleKey or "RightShift"
+            local idx = table.find(Appearance.keyOrder, cur) or 0
+            Settings.ToggleKey = Appearance.keyOrder[(idx % #Appearance.keyOrder) + 1]
+            paintKey()
+            Appearance.apply(false)
+            SaveSys.queue()
+            Log.add("Tecla do hub: " .. Settings.ToggleKey)
+        end, 84)
+        paintKey()
+        table.insert(H.painters, paintKey)
+    end
+    H.action(H.card(st, "Posição da janela", "Volta o painel para o centro", nso()), "Centralizar", function()
         Layout.centerPanel()
         Layout.apply(false)
         Log.add("Posicao da janela redefinida")
-    end)
-    actionButton(settingRow(7, "Favorites", "Remove all starred scripts"), "Clear", function()
+    end, 92)
+    H.action(H.card(st, "Favoritos", "Remove todos os scripts marcados", nso()), "Limpar", function()
         for k in pairs(Favs) do Favs[k] = nil end
         Filter.apply()
+        SaveSys.queue()
         Log.add("Favoritos limpos")
         Notify.push("Favoritos limpos.", Theme.Good)
     end)
 
-    sectionHeader("ABOUT", 8)
-    settingRow(9, Config.Name, Config.Author)
+    -- Jczz FPS
+    H.header(st, "JCZZ FPS", nso())
+    switchRow("Aplicar ao iniciar", "Reaplica suas otimizações toda vez que o hub abrir", "AutoFPS", false)
+    H.action(H.card(st, "Otimizações", "Desliga e restaura tudo que o Jczz FPS mudou", nso()), "Desligar", function()
+        FPS.disableAll()
+        Log.add("Jczz FPS: tudo desligado")
+        Notify.push("Otimizações desligadas e restauradas.", Theme.Warn)
+    end)
+
+    -- Dados
+    H.header(st, "DADOS", nso())
+    switchRow("Salvar configurações", "Guarda tudo em arquivo para a próxima vez", "SaveToFile", true)
+    H.action(H.card(st, "Restaurar padrões", "Volta todas as configurações ao original", nso()), "Restaurar", function()
+        local favs = Settings.Favorites
+        for k in pairs(Settings) do Settings[k] = nil end
+        SaveSys.fill(Settings)
+        if favs then Settings.Favorites = favs end
+        Accent.set(Settings.AccentName)
+        Layout.centerPanel()
+        Appearance.apply(false)
+        H.paintAll()
+        SaveSys.queue()
+        Log.add("Configuracoes restauradas")
+        Notify.push("Configurações restauradas.", Theme.Good)
+    end)
+    H.action(H.card(st, "Fechar o hub", "Remove a janela (as otimizações continuam ativas)", nso()), "Fechar", function()
+        if genv and genv.JczzAutomaticKeyConn then
+            pcall(function() genv.JczzAutomaticKeyConn:Disconnect() end)
+        end
+        FPSPage.setActive(false)
+        gui:Destroy()
+    end)
+
+    -- Sobre
+    H.header(st, "SOBRE", nso())
+    H.card(st, Config.Name, Config.Author, nso())
+    local execName = "Desconhecido"
+    pcall(function()
+        if identifyexecutor then execName = tostring((identifyexecutor())) end
+    end)
+    local canSave = typeof(writefile) == "function" and typeof(readfile) == "function"
+    H.card(st, "Executor: " .. execName, canSave and "Salvar arquivos: disponível" or "Salvar arquivos: indisponível", nso())
 
     -- Modal de key (dentro do painel, acima de tudo)
     UI.keyOverlay = mk("Frame", {
@@ -1740,6 +3046,8 @@ if genv and genv.JczzAutomaticKeyConn then
     pcall(function() genv.JczzAutomaticKeyConn:Disconnect() end)
 end
 
+if FPS.oldShutdown then pcall(FPS.oldShutdown) end
+
 UI.build(parent)
 
 -- posicao inicial do painel centralizada
@@ -1747,14 +3055,16 @@ Layout.centerPanel()
 
 UI.populate()
 Layout.apply(false)
+Appearance.apply(false)
 Status.refresh()
 Log.add("Jczz Automatic initialized")
-Panel.show()
+if Settings.StartOpen ~= false then Panel.show() end
+if Settings.AutoFPS then task.spawn(FPS.autoApply) end
 
 -- Atalho de teclado (PC)
 local keyConn = UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
-    if input.KeyCode == Enum.KeyCode.RightShift then Panel.toggle() end
+    if input.KeyCode.Name == (Settings.ToggleKey or "RightShift") then Panel.toggle() end
 end)
 if genv then genv.JczzAutomaticKeyConn = keyConn end
 
@@ -1767,11 +3077,4 @@ task.spawn(function()
 end)
 
 -- Fundo (grava a imagem uma vez e aplica; sem suporte do executor fica cor lisa)
-task.spawn(function()
-    local asset = loadBackground()
-    if asset and UI.bg and UI.bg.Parent then
-        UI.bg.Image = asset
-        UI.bg.Visible = true
-        UI.shade.BackgroundTransparency = 0.45
-    end
-end)
+Appearance.ensureBg()
